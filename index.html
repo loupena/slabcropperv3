@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PSA Slab Cropper</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { margin: 0; }
+        .spinner { animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+const TARGET_WIDTH = 919;
+const TARGET_HEIGHT = 1591;
+
+function PSASlabCropper() {
+  const [images, setImages] = React.useState([]);
+  const [cvReady, setCvReady] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [dragOver, setDragOver] = React.useState(false);
+  const fileInputRef = React.useRef(null);
+  const canvasRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (window.cv && window.cv.Mat) {
+      setCvReady(true);
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://docs.opencv.org/4.8.0/opencv.js';
+    script.async = true;
+    script.onload = () => {
+      const checkCv = setInterval(() => {
+        if (window.cv && window.cv.Mat) {
+          setCvReady(true);
+          clearInterval(checkCv);
+        }
+      }, 100);
+      setTimeout(() => clearInterval(checkCv), 30000);
+    };
+    document.body.appendChild(script);
+  }, []);
+
+  const processImage = React.useCallback(async (imageSrc, imageId) => {
+    if (!cvReady || !window.cv) return null;
+
+    try {
+      const cv = window.cv;
+      
+      const img = new Image();
+      img.src = imageSrc;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
+
+      const canvas = canvasRef.current;
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+
+      let src = cv.imread(canvas);
+      let hsv = new cv.Mat();
+      let brownMask = new cv.Mat();
+      let slabMask = new cv.Mat();
+      let contours = new cv.MatVector();
+      let hierarchy = new cv.Mat();
+
+      cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+      let hsvTemp = new cv.Mat();
+      cv.cvtColor(hsv, hsvTemp, cv.COLOR_RGB2HSV);
+      hsv.delete();
+      hsv = hsvTemp;
+
+      let channels = new cv.MatVector();
+      cv.split(hsv, channels);
+      let h = channels.get(0);
+      let s = channels.get(1);
+      let v = channels.get(2);
+      
+      let hMask = new cv.Mat();
+      let sMask = new cv.Mat();
+      let vMask = new cv.Mat();
+      let hMask2 = new cv.Mat();
+      let sMask2 = new cv.Mat();
+      let vMask2 = new cv.Mat();
+      
+      cv.threshold(h, hMask, 5, 255, cv.THRESH_BINARY);
+      cv.threshold(h, hMask2, 35, 255, cv.THRESH_BINARY_INV);
+      cv.threshold(s, sMask, 10, 255, cv.THRESH_BINARY);
+      cv.threshold(s, sMask2, 200, 255, cv.THRESH_BINARY_INV);
+      cv.threshold(v, vMask, 60, 255, cv.THRESH_BINARY);
+      cv.threshold(v, vMask2, 255, 255, cv.THRESH_BINARY_INV);
+      
+      cv.bitwise_and(hMask, hMask2, brownMask);
+      cv.bitwise_and(brownMask, sMask, brownMask);
+      cv.bitwise_and(brownMask, sMask2, brownMask);
+      cv.bitwise_and(brownMask, vMask, brownMask);
+      cv.bitwise_and(brownMask, vMask2, brownMask);
+      
+      let blackMask = new cv.Mat();
+      cv.threshold(v, blackMask, 50, 255, cv.THRESH_BINARY_INV);
+      
+      let backgroundMask = new cv.Mat();
+      cv.bitwise_or(brownMask, blackMask, backgroundMask);
+      cv.bitwise_not(backgroundMask, slabMask);
+      
+      let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+      cv.morphologyEx(slabMask, slabMask, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 3);
+      cv.morphologyEx(slabMask, slabMask, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 2);
+      
+      cv.findContours(slabMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      let maxArea = 0;
+      let largestIdx = -1;
+      for (let i = 0; i < contours.size(); i++) {
+        const area = cv.contourArea(contours.get(i));
+        if (area > maxArea) {
+          maxArea = area;
+          largestIdx = i;
+        }
+      }
+
+      let final = new cv.Mat();
+      
+      if (largestIdx >= 0 && maxArea > src.rows * src.cols * 0.05) {
+        const largest = contours.get(largestIdx);
+        const rect = cv.minAreaRect(largest);
+        const center = rect.center;
+        const size = rect.size;
+        let angle = rect.angle;
+        
+        let width = size.width;
+        let height = size.height;
+        
+        if (width > height) {
+          angle = angle + 90;
+          [width, height] = [height, width];
+        }
+        
+        let rotated;
+        if (Math.abs(angle) > 0.5) {
+          const M = cv.getRotationMatrix2D(center, angle, 1.0);
+          rotated = new cv.Mat();
+          cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_LANCZOS4, cv.BORDER_CONSTANT, new cv.Scalar(0, 0, 0, 0));
+          M.delete();
+          
+          let rotatedMask = new cv.Mat();
+          let M2 = cv.getRotationMatrix2D(center, angle, 1.0);
+          cv.warpAffine(slabMask, rotatedMask, M2, new cv.Size(src.cols, src.rows), cv.INTER_NEAREST, cv.BORDER_CONSTANT, new cv.Scalar(0));
+          M2.delete();
+          
+          let rotContours = new cv.MatVector();
+          let rotHierarchy = new cv.Mat();
+          cv.findContours(rotatedMask, rotContours, rotHierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+          
+          if (rotContours.size() > 0) {
+            let rotLargest = null;
+            let rotMaxArea = 0;
+            for (let i = 0; i < rotContours.size(); i++) {
+              const area = cv.contourArea(rotContours.get(i));
+              if (area > rotMaxArea) {
+                rotMaxArea = area;
+                rotLargest = rotContours.get(i);
+              }
+            }
+            
+            if (rotLargest) {
+              const boundRect = cv.boundingRect(rotLargest);
+              const margin = 15;
+              const x = Math.max(0, boundRect.x + margin);
+              const y = Math.max(0, boundRect.y + margin);
+              const w = Math.min(boundRect.width - margin * 2, rotated.cols - x);
+              const h = Math.min(boundRect.height - margin * 2, rotated.rows - y);
+              
+              if (w > 0 && h > 0) {
+                let cropped = rotated.roi(new cv.Rect(x, y, w, h));
+                cv.resize(cropped, final, new cv.Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, cv.INTER_LANCZOS4);
+                cropped.delete();
+              }
+            }
+          }
+          
+          rotContours.delete();
+          rotHierarchy.delete();
+          rotatedMask.delete();
+          rotated.delete();
+        } else {
+          const boundRect = cv.boundingRect(largest);
+          const margin = 15;
+          const x = Math.max(0, boundRect.x + margin);
+          const y = Math.max(0, boundRect.y + margin);
+          const w = Math.min(boundRect.width - margin * 2, src.cols - x);
+          const h = Math.min(boundRect.height - margin * 2, src.rows - y);
+          
+          if (w > 0 && h > 0) {
+            let cropped = src.roi(new cv.Rect(x, y, w, h));
+            
+            if (cropped.cols > cropped.rows) {
+              let rotatedCrop = new cv.Mat();
+              cv.rotate(cropped, rotatedCrop, cv.ROTATE_90_CLOCKWISE);
+              cropped.delete();
+              cropped = rotatedCrop;
+            }
+            
+            cv.resize(cropped, final, new cv.Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, cv.INTER_LANCZOS4);
+            cropped.delete();
+          }
+        }
+      }
+      
+      if (final.empty()) {
+        cv.resize(src, final, new cv.Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, cv.INTER_LANCZOS4);
+      }
+
+      // Rotate 180 degrees to ensure correct orientation (PSA label at top)
+      cv.rotate(final, final, cv.ROTATE_180);
+
+      let rgba = new cv.Mat();
+      cv.cvtColor(final, rgba, cv.COLOR_RGB2RGBA);
+
+      const outputCanvas = document.createElement('canvas');
+      outputCanvas.width = TARGET_WIDTH;
+      outputCanvas.height = TARGET_HEIGHT;
+      cv.imshow(outputCanvas, rgba);
+      
+      const dataUrl = outputCanvas.toDataURL('image/png');
+
+      src.delete();
+      hsv.delete();
+      brownMask.delete();
+      blackMask.delete();
+      backgroundMask.delete();
+      slabMask.delete();
+      contours.delete();
+      hierarchy.delete();
+      kernel.delete();
+      channels.delete();
+      h.delete();
+      s.delete();
+      v.delete();
+      hMask.delete();
+      hMask2.delete();
+      sMask.delete();
+      sMask2.delete();
+      vMask.delete();
+      vMask2.delete();
+      final.delete();
+      rgba.delete();
+
+      return dataUrl;
+    } catch (err) {
+      console.error('Processing error:', err);
+      return null;
+    }
+  }, [cvReady]);
+
+  const handleFiles = async (files) => {
+    if (!cvReady) {
+      setError('OpenCV is still loading, please wait...');
+      return;
+    }
+
+    setError(null);
+    const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+    
+    if (imageFiles.length === 0) {
+      setError('Please upload image files');
+      return;
+    }
+
+    const newImages = imageFiles.map((file, idx) => ({
+      id: Date.now() + idx,
+      name: file.name,
+      original: null,
+      processed: null,
+      status: 'loading'
+    }));
+
+    setImages(prev => [...prev, ...newImages]);
+
+    for (let i = 0; i < imageFiles.length; i++) {
+      const file = imageFiles[i];
+      const imageId = newImages[i].id;
+
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const originalSrc = e.target.result;
+        
+        setImages(prev => prev.map(img => 
+          img.id === imageId ? { ...img, original: originalSrc, status: 'processing' } : img
+        ));
+
+        const processed = await processImage(originalSrc, imageId);
+        
+        setImages(prev => prev.map(img => 
+          img.id === imageId ? { 
+            ...img, 
+            processed, 
+            status: processed ? 'done' : 'error' 
+          } : img
+        ));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer.files.length > 0) {
+      handleFiles(e.dataTransfer.files);
+    }
+  };
+
+  const reset = () => {
+    setImages([]);
+    setError(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const removeImage = (id) => {
+    setImages(prev => prev.filter(img => img.id !== id));
+  };
+
+  const downloadOne = (dataUrl, name) => {
+    const byteString = atob(dataUrl.split(',')[1]);
+    const mimeString = dataUrl.split(',')[0].split(':')[1].split(';')[0];
+    const ab = new ArrayBuffer(byteString.length);
+    const ia = new Uint8Array(ab);
+    for (let i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i);
+    }
+    const blob = new Blob([ab], { type: mimeString });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name.replace(/\.[^/.]+$/, '') + '_cropped.png';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const rotateImage = async (id) => {
+    const img = images.find(i => i.id === id);
+    if (!img || !img.processed) return;
+    
+    const image = new Image();
+    image.src = img.processed;
+    await new Promise(resolve => { image.onload = resolve; });
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx = canvas.getContext('2d');
+    
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(Math.PI);
+    ctx.drawImage(image, -image.width / 2, -image.height / 2);
+    
+    const rotatedDataUrl = canvas.toDataURL('image/png');
+    
+    setImages(prev => prev.map(i => 
+      i.id === id ? { ...i, processed: rotatedDataUrl } : i
+    ));
+  };
+
+  const downloadAll = async () => {
+    const completed = images.filter(img => img.status === 'done' && img.processed);
+    if (completed.length === 0) return;
+    
+    const zip = new JSZip();
+    
+    for (const img of completed) {
+      const base64Data = img.processed.split(',')[1];
+      const fileName = img.name.replace(/\.[^/.]+$/, '') + '_cropped.png';
+      zip.file(fileName, base64Data, { base64: true });
+    }
+    
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'psa_slabs_cropped.zip';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const completedCount = images.filter(img => img.status === 'done').length;
+  const processingCount = images.filter(img => img.status === 'processing' || img.status === 'loading').length;
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-white p-6">
+      <canvas ref={canvasRef} style={{ display: 'none' }} />
+      
+      <div className="max-w-6xl mx-auto">
+        <h1 className="text-2xl font-semibold text-center mb-1">PSA Slab Cropper</h1>
+        <p className="text-neutral-500 text-center text-sm mb-8">
+          Auto-detect, straighten, and crop PSA slabs to 919×1591px
+        </p>
+
+        {!cvReady && (
+          <div className="bg-neutral-900 rounded-xl p-6 text-center mb-6">
+            <div className="flex items-center justify-center gap-3">
+              <div className="w-5 h-5 border-2 border-neutral-700 border-t-blue-500 rounded-full spinner" />
+              <span className="text-neutral-400">Loading OpenCV.js...</span>
+            </div>
+          </div>
+        )}
+
+        {cvReady && (
+          <div
+            className={`border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all mb-6 ${
+              dragOver ? 'border-blue-500 bg-blue-950/30' : 'border-neutral-800 bg-neutral-900 hover:border-neutral-600'
+            }`}
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+          >
+            <div className="text-4xl mb-3">📷</div>
+            <div className="text-neutral-300 mb-1">Drop your scanned slab images here</div>
+            <div className="text-neutral-600 text-sm">or click to select files (multiple allowed)</div>
+          </div>
+        )}
+
+        <input
+          type="file"
+          ref={fileInputRef}
+          className="hidden"
+          accept="image/*"
+          multiple
+          onChange={(e) => e.target.files?.length && handleFiles(e.target.files)}
+        />
+
+        {error && (
+          <div className="bg-red-950 border border-red-900 text-red-400 rounded-xl p-4 text-center mb-6">
+            {error}
+          </div>
+        )}
+
+        {images.length > 0 && (
+          <>
+            <div className="flex items-center justify-between mb-4">
+              <div className="text-sm text-neutral-400">
+                {completedCount} of {images.length} processed
+                {processingCount > 0 && <span className="ml-2 text-blue-400">({processingCount} in progress...)</span>}
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={downloadAll}
+                  disabled={completedCount === 0}
+                  className="px-5 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-neutral-800 disabled:text-neutral-600 rounded-lg text-sm font-medium transition-colors"
+                >
+                  Download All as ZIP ({completedCount})
+                </button>
+                <button
+                  onClick={reset}
+                  className="px-5 py-2 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium transition-colors"
+                >
+                  Clear All
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+              {images.map((img) => (
+                <div key={img.id} className="bg-neutral-900 rounded-xl p-3 relative group">
+                  <button
+                    onClick={() => removeImage(img.id)}
+                    className="absolute top-2 right-2 w-6 h-6 bg-neutral-800 hover:bg-red-600 rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                  >
+                    ✕
+                  </button>
+                  
+                  <div className="bg-neutral-950 rounded-lg aspect-[919/1591] flex items-center justify-center overflow-hidden mb-2">
+                    {img.status === 'loading' && (
+                      <div className="text-neutral-600 text-sm">Loading...</div>
+                    )}
+                    {img.status === 'processing' && (
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="w-5 h-5 border-2 border-neutral-700 border-t-blue-500 rounded-full spinner" />
+                        <span className="text-neutral-500 text-xs">Processing</span>
+                      </div>
+                    )}
+                    {img.status === 'done' && img.processed && (
+                      <img src={img.processed} alt="Processed" className="w-full h-full object-contain" />
+                    )}
+                    {img.status === 'error' && (
+                      <div className="text-red-500 text-sm">Failed</div>
+                    )}
+                  </div>
+                  
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-neutral-500 truncate flex-1 mr-2" title={img.name}>
+                      {img.name}
+                    </div>
+                    {img.status === 'done' && img.processed && (
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => rotateImage(img.id)}
+                          className="text-xs text-neutral-400 hover:text-white"
+                          title="Rotate 180°"
+                        >
+                          🔄
+                        </button>
+                        <button
+                          onClick={() => downloadOne(img.processed, img.name)}
+                          className="text-xs text-blue-400 hover:text-blue-300"
+                        >
+                          Download
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        <p className="text-center text-neutral-600 text-sm mt-8">
+          Output: 919×1591px PNG (straightened)
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<PSASlabCropper />, document.getElementById('root'));
+    </script>
+</body>
+</html>
